@@ -71,7 +71,8 @@ type ToolSet struct {
 	Reason    string
 	writes    WriteCounts
 	// killWork, if set, terminates a running work by intent id (engine callback,
-	// wired by the planner). nil = the kill_work tool reports unavailable.
+	// wired by the planner). nil = deprecate_intent's running branch reports
+	// unavailable. Kept name for the engine-side wiring (task_llm.go SetKillWork).
 	killWork func(intentID int64) error
 	// steerWork, if set, queues a mid-run course-correction for the work running an
 	// intent id (engine callback, wired by the planner): the worker injects it before
@@ -491,6 +492,64 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		recentFacts = append(recentFacts, m)
 	}
 	out["recent_facts"] = recentFacts
+	// pending_facts：从未被任何意图引用（无 derived_from 出边）的事实=未消费线索，最老在前
+	// 的一窗（≤N）。与 recent_facts（最新 20，看"刚发生的"）互补：这里捞的是沉出窗口、
+	// 乃至已被折进 cold digest 的饿死线索——冷区折叠恰恰以"无引用"为判据，同一谓词这里
+	// 从折叠依据翻转为展示依据。被新意图引用（add_intent 的 parent_ids）后自动离队，纯
+	// 视图零簿记。与 recent_facts 已显示的 id 去重（任务早期两窗口高度重叠时防双列）。
+	// pending_total 是全量计数：窗口是截断视图，别把"没显示"当成"没有"。
+	const pendingFactsCap = 10
+	if pfs, err := t.ts.PendingFacts(pendingFactsCap + len(recentFacts)); err == nil {
+		shown := make(map[int64]bool, len(recentFacts))
+		for _, m := range recentFacts {
+			if id, ok := m["id"].(int64); ok {
+				shown[id] = true
+			}
+		}
+		pending := make([]map[string]any, 0, pendingFactsCap)
+		for _, n := range pfs {
+			if len(pending) >= pendingFactsCap {
+				break
+			}
+			if shown[n.ID] {
+				continue // 已在 recent_facts 窗口里，不双列
+			}
+			m := compactNode(n)
+			if from := factFrom[n.ID]; from > 0 {
+				m["from_intent"] = from // 这条线索由哪个意图挖出
+			}
+			var fp map[string]any
+			if json.Unmarshal(n.Payload, &fp) == nil {
+				if c, ok := fp["confidence"].(string); ok && c != "" {
+					m["confidence"] = c // inferred 的线索别当已验证原语直接用
+				}
+			}
+			pending = append(pending, m)
+		}
+		if len(pending) > 0 {
+			out["pending_facts"] = pending
+			if c, cerr := t.ts.CountPendingFacts(); cerr == nil {
+				out["pending_total"] = c
+			}
+		}
+	}
+	// deprecated_intents：被废弃（stopped）的意图=方向裁决墓碑，最新在前的一窗（≤10）。
+	// 与 recent_done（执行结果，12 格滚动窗）刻意分离：墓碑的价值是长期在场防重派，
+	// 不能随滚动窗衰减；条目在 compactIntents 形状上追加 stop_reason（历史 stopped 行
+	// 无原因则省略字段）。deprecated_total 为配对计数。deleted（人删）不属于墓碑。
+	const deprecatedCap = 10
+	if deps, derr := t.ts.DeprecatedIntents(deprecatedCap); derr == nil && len(deps) > 0 {
+		entries := compactIntents(deps, parentsOf, yieldsOf)
+		for i, n := range deps {
+			if n.StopReason != "" {
+				entries[i]["stop_reason"] = n.StopReason // 否决性/止损性判断的依据文本
+			}
+		}
+		out["deprecated_intents"] = entries
+		if c, cerr := t.ts.CountDeprecatedIntents(); cerr == nil {
+			out["deprecated_total"] = c
+		}
+	}
 	// recent_done_intents：非折叠的已结束意图里最新的一窗（≤N，recentDone 已按 id 降序）。
 	// 更早的看 done_intents_total 计数 + node_detail(id)。
 	const recentDoneCap = 12
@@ -1351,13 +1410,9 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 }
 
 func (t *ToolSet) recordFact() actool.CoreTool {
-	return t.writeExpTool("record_fact", "把探索【事实/结论】写入探索图，连到产生它的意图（intent_id）。用于记录探索结果——包括指纹/枚举等【正向结论】，和'端口关闭'/'参数不可注入'/'未发现登录入口'等【否定结论】。\n"+
-		"⚠️一次探索的多个观察要【汇总成一条事实】，不要拆成多条，可以合并成一条事实的就尽量用一条事实表示：summary=对本次结论的总结性一句话，detail=相关细节（可含多个具体项）。例：指纹意图→一条事实 {summary:'识别了 X 站点的技术栈与响应特征', detail:'nginx 1.25 / Vue3 / 200 / title=.. / body_len=..'}，而不是状态码、指纹、标题各记一条。一条意图通常只产出一条事实，拆太碎会让图谱无限膨胀。\n"+
-		"★facts 数组用于一次写多条【彼此不同】的结论（每条可省略 intent_id，默认用顶层 intent_id）。返回 ids 数组，与 facts 等长同序。\n"+
-		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
-		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
-		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
-		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
+	return t.writeExpTool("record_fact", "把探索结论写入探索图，连到产生它的意图（intent_id）。每确认一条独立结论就立即提交一条，别攒批——正向结论和否定结论（端口关闭/不可注入/未发现入口等）都一样提交，否定结论如实标注即可，方向是否放弃由规划者综合全局定。\n"+
+		"summary=结论一句话，detail=细节；evidence=一行关键证据（命令+最能证明的输出）；confidence=observed（直接看到）| inferred（据现象推断）；只写工具输出里真实看到的，别重复图里已有的。\n"+
+		"★facts 数组用于一次写多条【彼此不同】的结论（每条可省略 intent_id，默认用顶层 intent_id）。返回 ids 数组，与 facts 等长同序。",
 		obj(map[string]any{
 			"facts":      map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"summary":    str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
@@ -1672,39 +1727,76 @@ func (t *ToolSet) addHint() actool.CoreTool {
 		})
 }
 
-// killWorkTool lets the planner terminate a single running work (by intent id).
-func (t *ToolSet) killWorkTool() actool.CoreTool {
-	return t.writeExpTool("kill_work", "终止一条正在运行的意图(work)。用于叫停跑偏/无意义的探索；被终止的意图标记为 stopped，不再自动重领。先用 get_worker_output 看看它在干嘛再决定。",
-		obj(map[string]any{"intent_id": idp("要终止的意图 id（= work 句柄）")}, "intent_id"),
+// deprecateIntent is the planner's single stop verb: "this intent should not
+// continue, because <reason>". It replaces kill_work — an open intent is CAS'd
+// to stopped directly, a running one is stopped through the engine's kill
+// callback (decision in planner, execution in engine, settle in worker). The
+// reason lands on the row BEFORE the transition/cancel so the tombstone
+// (deprecated_intents) is complete the moment the state flips.
+func (t *ToolSet) deprecateIntent() actool.CoreTool {
+	return t.writeExpTool("deprecate_intent",
+		"废弃一条意图（排队中或运行中）：排队单直接移出队列；运行单经引擎停止（worker 会就地收尾）。"+
+			"原因必填、随图保留（deprecated_intents 常驻可见、防重派）——否决性原因写清依据（如'前提已被事实#N推翻'），"+
+			"止损性原因写明方向是否仍可换打法重估。运行中的先 get_worker_output 看看它在干嘛再决定。",
+		obj(map[string]any{
+			"intent_id": idp("要废弃的意图 id"),
+			"reason":    str("废弃原因（必填）：否决性写依据，止损性写可否重估"),
+		}, "intent_id", "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
-			if t.killWork == nil {
-				return actool.Errorf("kill_work 当前不可用"), nil
-			}
 			var a struct {
 				IntentID json.RawMessage `json:"intent_id"`
+				Reason   string          `json:"reason"`
 			}
 			_ = json.Unmarshal(in, &a)
 			id := pid(a.IntentID)
+			reason := strings.TrimSpace(a.Reason)
 			if id <= 0 {
 				return actool.Errorf("intent_id 必填"), nil
+			}
+			if reason == "" {
+				return actool.Errorf("reason 必填：墓碑的原因是防重派的唯一依据，不能为空"), nil
 			}
 			node, err := t.ts.GetNode(id)
 			if err != nil || node == nil || node.Kind != db.KindIntent {
 				return actool.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）"), nil
 			}
-			if err := t.killWork(id); err != nil {
-				return actool.Errorf(err.Error()), nil
+			switch node.State {
+			case "open":
+				if err := t.ts.SetIntentStopReason(id, reason); err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+				if changed, err := t.ts.CompareAndSetIntentState(id, "open", "stopped"); err != nil {
+					return actool.Errorf(err.Error()), nil
+				} else if changed {
+					return actool.Text(fmt.Sprintf("意图 %d 已废弃（stopped），原因已落库", id)), nil
+				}
+				// CAS 未命中=恰在此刻被 worker 领走（open→running 竞态）→ 顺延走 running 分支停工。
+				fallthrough
+			case "running":
+				if t.killWork == nil {
+					return actool.Errorf("deprecate_intent 当前不可用（引擎停工通道未接线）"), nil
+				}
+				if err := t.ts.SetIntentStopReason(id, reason); err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+				if err := t.killWork(id); err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+				return actool.Text(fmt.Sprintf("意图 %d 已写入废弃原因并向其 work 发送终止信号", id)), nil
+			case "paused":
+				return actool.Errorf(fmt.Sprintf("意图 %d 被人暂停，请走人工删除", id)), nil
+			default:
+				return actool.Errorf(fmt.Sprintf("意图 %d 已是终态（%s），无需废弃", id, node.State)), nil
 			}
-			return actool.Text(fmt.Sprintf("已向意图 %d 的 work 发送终止信号", id)), nil
 		})
 }
 
 // steerWorkTool lets the planner inject a mid-run course-correction into a running
 // work WITHOUT killing it: the message reaches the worker before its next tool call,
 // which re-plans its next step (already-gathered context is kept). For in-intent
-// nudges ("停做 X、聚焦 Y"); if the whole direction is wrong use kill_work + a new intent.
+// nudges ("停做 X、聚焦 Y"); if the whole direction is wrong use deprecate_intent + a new intent.
 func (t *ToolSet) steerWorkTool() actool.CoreTool {
-	return t.writeExpTool("steer_work", "给一条正在运行的意图(work)实时注入纠偏指令，不打断它、不丢已有进展：worker 会在下一步动作前收到你的指令并据此调整。用于'别再走 X、聚焦 Y'这类【意图内】纠偏；若方向整个错了应改用 kill_work 再下新意图。建议先用 get_worker_output 看它在干嘛。",
+	return t.writeExpTool("steer_work", "给一条正在运行的意图(work)实时注入纠偏指令，不打断它、不丢已有进展：worker 会在下一步动作前收到你的指令并据此调整。用于'别再走 X、聚焦 Y'这类【意图内】纠偏；若方向整个错了应改用 deprecate_intent 废弃（原因必填）再下新意图。建议先用 get_worker_output 看它在干嘛。",
 		obj(map[string]any{
 			"intent_id": idp("要纠偏的意图 id（= work 句柄）"),
 			"message":   str("给 worker 的纠偏指令，明确让它停止什么、转向什么"),
@@ -2036,7 +2128,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
-		t.killWorkTool(), t.steerWorkTool(),
+		t.deprecateIntent(), t.steerWorkTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),
 		// list_companies：查看企业列表 + scope + 资产数（拿 company_id / 理解归属范围）。

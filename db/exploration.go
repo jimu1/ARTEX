@@ -77,6 +77,7 @@ type Node struct {
 	Owner         string          `json:"owner,omitempty"`
 	BlockedReason string          `json:"blocked_reason,omitempty"`
 	DeleteReason  string          `json:"delete_reason,omitempty"` // 仅意图假删除(state='deleted')时非空
+	StopReason    string          `json:"stop_reason,omitempty"`   // 仅意图废弃(state='stopped')时非空;历史 stopped 行为 NULL
 	Anchors       []int64         `json:"anchors,omitempty"`
 	CreatedAt     time.Time       `json:"created_at"`
 	SourceTaskID  int64           `json:"source_task_id,omitempty"`
@@ -698,12 +699,12 @@ func (u *TokenUsage) add(other TokenUsage) {
 	u.CacheWriteTokens += other.CacheWriteTokens
 }
 
-const nodeCols = `id, kind, payload, priority, state, COALESCE(origin,''), COALESCE(owner,''), COALESCE(blocked_reason,''), COALESCE(delete_reason,''), created_at`
+const nodeCols = `id, kind, payload, priority, state, COALESCE(origin,''), COALESCE(owner,''), COALESCE(blocked_reason,''), COALESCE(delete_reason,''), COALESCE(stop_reason,''), created_at`
 
 func scanNode(sc interface{ Scan(...any) error }) (*Node, error) {
 	var n Node
 	var payload []byte
-	if err := sc.Scan(&n.ID, &n.Kind, &payload, &n.Priority, &n.State, &n.Origin, &n.Owner, &n.BlockedReason, &n.DeleteReason, &n.CreatedAt); err != nil {
+	if err := sc.Scan(&n.ID, &n.Kind, &payload, &n.Priority, &n.State, &n.Origin, &n.Owner, &n.BlockedReason, &n.DeleteReason, &n.StopReason, &n.CreatedAt); err != nil {
 		return nil, err
 	}
 	n.Payload = json.RawMessage(payload)
@@ -815,6 +816,82 @@ func (s *ExplorationStore) CountOpenIntents() (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID).Scan(&n)
+	return n, err
+}
+
+// PendingFacts lists facts that no intent has ever derived from (no
+// fact --derived_from--> intent out-edge), oldest first, excluding the task
+// root origin fact. These are the exploration's unconsumed leads —
+// graph_overview's pending_facts lifts them back into view instead of letting
+// them sink out of the recency windows (and eventually into cold digests).
+// Deliberately NOT filtered by digest coverage: folded pending facts are the
+// ones most in need of rescue. Pure view — a fact leaves the list the moment
+// some intent cites it (Link derived_from), no bookkeeping to drift.
+func (s *ExplorationStore) PendingFacts(limit int) ([]*Node, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes n
+WHERE n.exploration_id=$1 AND n.kind='fact' AND n.state <> 'origin'
+  AND NOT EXISTS (SELECT 1 FROM exploration_edges e
+                  WHERE e.exploration_id=$1 AND e.src_id=n.id AND e.rel='derived_from')
+ORDER BY n.id ASC LIMIT $2`, s.expID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// CountPendingFacts counts this exploration's pending facts — graph_overview's
+// pending_total, so the planner knows pending_facts (capped window) may be a
+// truncated view of the unconsumed-lead backlog.
+func (s *ExplorationStore) CountPendingFacts() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes n
+WHERE n.exploration_id=$1 AND n.kind='fact' AND n.state <> 'origin'
+  AND NOT EXISTS (SELECT 1 FROM exploration_edges e
+                  WHERE e.exploration_id=$1 AND e.src_id=n.id AND e.rel='derived_from')`, s.expID).Scan(&n)
+	return n, err
+}
+
+// SetIntentStopReason records why an intent is being deprecated (state='stopped')
+// — the tombstone text deprecated_intents surfaces for re-dispatch dedup. Called
+// BEFORE the state transition (or before the engine cancels a running work), so
+// the reason is already on the row the moment the terminal state lands.
+func (s *ExplorationStore) SetIntentStopReason(id int64, reason string) error {
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET stop_reason=$3, content_version=content_version+1
+WHERE id=$1 AND exploration_id=$2 AND kind='intent'`, id, s.expID, reason)
+	return err
+}
+
+// DeprecatedIntents lists this exploration's deprecated (stopped) intents, newest
+// first — graph_overview's deprecated_intents standing tombstone list. Unlike
+// recent_done_intents this is NOT a recency window: a tombstone's whole value is
+// staying visible so a rejected direction is not re-dispatched. Deliberately not
+// filtered by digest coverage (same call as pending facts). Legacy stopped rows
+// carry NULL stop_reason — they still list, just without the field.
+func (s *ExplorationStore) DeprecatedIntents(limit int) ([]*Node, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state='stopped'
+ORDER BY id DESC LIMIT $2`, s.expID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// CountDeprecatedIntents counts this exploration's stopped intents — pairs with
+// deprecated_intents so the planner knows the list may be a truncated view.
+func (s *ExplorationStore) CountDeprecatedIntents() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state='stopped'`, s.expID).Scan(&n)
 	return n, err
 }
 

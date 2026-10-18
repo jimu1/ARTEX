@@ -227,20 +227,27 @@ func proxyEnv(proxyAddr, caCert string) []string {
 // prompt, seeded into agent_prompts. The trafficTool block and the 中间产物输出规约
 // are NOT here — they are code-owned and appended by workerSystem after rendering
 // (段 [B]/[C]), so editing the DB body can never drop them.
-const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系统的"执行者"(work agent)。你领到【一条意图】(一句话探索方向)，唯一职责：**完成这一条意图、把发现写回知识图谱、然后停止返回。**
+//
+// 设计取向（Less Is More，参考 Cairn execute.md）：只保留机制契约（写回哪个图、
+// 必带参数、证据标准）与释放式框架（先理解再动手、失败合法、不预设打法）；图谱
+// 卫生（防重复/防膨胀/防重派）不在这里管——由 planner 侧机制兜底（pending_facts
+// 捞未消费线索、deprecated_intents 封死否决方向、窗口+计数自描述截断）。
+const workerDefaultTmpl = `你是授权渗透测试系统的执行者，领到【一条意图】（一句话探索方向）。
 
-**边界（红线）**：
-1. **只做你领到的这一条意图**。**探本意图时若瞥见本意图之外值得深挖的线索**（报错泄露的路径、可能与其它资产联动的点、疑似另一条利用链的入口），**在 fact 的 summary 里点一句交给规划者**。
-2. 初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——把本意图的所有绕过手段走完再输出结论；
-3. 只在授权范围内操作。系统提示顶部若附【操作约束】，那是最高优先级红线：每条命令/探测执行前先自检，违反即不做（哪怕它落在你领到的意图里）。
+先理解再动手：看清你的意图、它锚定的目标资产、以及下方态势快照里别人已经确认了什么——别重复别人的工作。怎么打由你决定：方法、顺序、深度不设任何预设；授权范围内（含顶部【操作约束】红线）你说了算。
 
-**边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
-- **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
-- **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
-- **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
+范围只有一条：这条意图是你的；执行中瞥见的其它线索（别的资产、疑似另一条利用链的入口）用 fact 记一句交给规划者，不亲自展开。
 
+受阻不是结论——绕过手段没穷尽前，这个方向不算探透。失败也是产出：否定结论照实写回，和成功结论一样值钱，它替全系统省掉重走一遍的路。
 
-完成本意图后用一句话总结你做了什么、写回了哪些事实。`
+写回契约（边确认边写——会话随时可能被截断，没写回的等于没发生）：
+- **新资产 → insert_assets，全量登记、不选样**：子域/接口/指纹/凭据/服务，发现即登记；**批量枚举的成果（从 JS 提取的 API 清单、路径爆破命中、子域列表）整批全量入册**——文件留正文，资产图留索引（url/method/params）。登记了才算攻击面：规划者派单、覆盖统计、后续任务都只读资产图；躺在本地文件或对话里的等于没发现。
+- **每确认一条独立结论** → **record_fact**：传 intent_id；结论涉及的资产务必带 asset_ids（覆盖统计和后来的 worker 都靠它找到这条路）；evidence 一行（命令+最能证明的输出）；推断的结论标 confidence=inferred，直接看到的默认 observed；别重复图里已有的
+- **真实触发且拿到可复现证据的漏洞** → **report_finding**；够不上这个标准就只是 fact
+
+长输出（响应体/字典/脚本产物）写进本意图工作目录的文件，正文里只放路径。
+
+干完这条意图（或确认干不动了），用一句话总结你做了什么、写回了什么，然后停止。`
 
 // workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
@@ -331,10 +338,7 @@ func renderWorkerGraphOverview(data map[string]any) string {
 	if err != nil {
 		return "" // fall back silently: the worker just won't have the global context
 	}
-	return "\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：\n" +
-		"下面是整个任务当前的探索概况。用途有两个：一是知道别人已发现什么，别重复；二是让你探自己这条意图时，能联想到它和全局的关系。\n" +
-		"**发散是好事**：探本意图时尽管深想、多联想。唯一的界线是——别真的动手去执行别的意图（那是别的 worker 的事，由规划者调度）。但凡你联想到有价值的线索（跨资产的联动、疑似另一条利用链的入口、全局层面的可疑点），**务必写进 fact 交规划者**——这是你重要的产出，不是可有可无。宁可多报一条让规划者判断，也别自己咽下去。\n" +
-		string(b)
+	return "\n\n【全局态势快照（只读——供理解大局、防止重复劳动；范围规则见上）】：\n" + string(b)
 }
 
 // Execute runs one intent. hooks (the per-task Guard) gates every tool call; may
@@ -417,7 +421,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			}
 		}
 	}
-	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
+	sysBody += "\n\n开始执行你领到的这条意图。"
 	system, boundary := deferredSystem(sysBody, def)
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
@@ -487,7 +491,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// overview 罕见地 marshal 失败为空时，回退一句启动词，避免首轮出现空 user 消息。
 	input := overview
 	if strings.TrimSpace(input) == "" {
-		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
+		input = "开始执行 system 里领到的这条意图。"
 	}
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。

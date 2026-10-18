@@ -294,3 +294,157 @@ func TestNodesPageQueryMatchesID(t *testing.T) {
 		t.Fatalf("non-existent id: total=%d nodes=%+v, want empty", total, nodes)
 	}
 }
+
+func TestPendingFacts(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	expID, err := d.CreateExploration("test", "pending facts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID) // cascades nodes/edges
+	es := d.Exploration(expID)
+
+	// origin fact（任务根，应被排除）
+	if _, err := es.AddNode("fact", map[string]any{"summary": "任务起点"}, 0, "origin", "system", nil); err != nil {
+		t.Fatal(err)
+	}
+	// 两条未引用事实（老→新）
+	f1, err := es.AddNode("fact", map[string]any{"summary": "线索A"}, 5, "confirmed", "worker-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2, err := es.AddNode("fact", map[string]any{"summary": "线索B"}, 5, "confirmed", "worker-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 一条将被意图引用的事实 + 引用它的意图（addOneIntent 的 Link 路径）
+	f3, err := es.AddNode("fact", map[string]any{"summary": "已消费"}, 5, "confirmed", "worker-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := es.AddIntent(map[string]any{"summary": "consume f3"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := es.Link(f3, RelDerivedFrom, it); err != nil {
+		t.Fatal(err)
+	}
+
+	// 只含未引用事实、最老在前、不含 origin。
+	pfs, err := es.PendingFacts(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pfs) != 2 || pfs[0].ID != f1 || pfs[1].ID != f2 {
+		t.Fatalf("pending facts want [f1,f2] oldest-first, got %+v", pfs)
+	}
+	if c, err := es.CountPendingFacts(); err != nil || c != 2 {
+		t.Fatalf("count pending: c=%d err=%v, want 2", c, err)
+	}
+
+	// 引用 f1 后它自动离队——纯视图，零簿记。
+	if err := es.Link(f1, RelDerivedFrom, it); err != nil {
+		t.Fatal(err)
+	}
+	pfs, err = es.PendingFacts(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pfs) != 1 || pfs[0].ID != f2 {
+		t.Fatalf("after citing f1 pending want [f2], got %+v", pfs)
+	}
+	if c, _ := es.CountPendingFacts(); c != 1 {
+		t.Fatalf("count after cite: %d, want 1", c)
+	}
+}
+
+func TestDeprecateIntentQueries(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	expID, err := d.CreateExploration("test", "deprecate queries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+
+	// 两条 open 意图：i1 走完整废弃流（原因→CAS），i2 只停不写原因（模拟历史 stopped）。
+	i1, err := es.AddIntent(map[string]any{"summary": "方向A"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	i2, err := es.AddIntent(map[string]any{"summary": "方向B"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 先写原因再转状态（deprecate_intent 的调用序）。
+	if err := es.SetIntentStopReason(i1, "前提已被事实#42推翻"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := es.CompareAndSetIntentState(i1, "open", "stopped"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	// i2 模拟历史/急停：仅 CAS，无原因。
+	if ok, err := es.CompareAndSetIntentState(i2, "open", "stopped"); err != nil || !ok {
+		t.Fatal(err)
+	}
+
+	// DeprecatedIntents：最新在前；i1 带原因、i2 原因为空（NULL→""）。
+	deps, err := es.DeprecatedIntents(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 2 || deps[0].ID != i2 || deps[1].ID != i1 {
+		t.Fatalf("deprecated want newest-first [i2,i1], got %+v", deps)
+	}
+	if deps[1].StopReason != "前提已被事实#42推翻" {
+		t.Fatalf("i1 stop_reason missing: %+v", deps[1])
+	}
+	if deps[0].StopReason != "" {
+		t.Fatalf("legacy stopped should have empty StopReason: %+v", deps[0])
+	}
+	if c, err := es.CountDeprecatedIntents(); err != nil || c != 2 {
+		t.Fatalf("count deprecated: c=%d err=%v, want 2", c, err)
+	}
+
+	// 原因可幂等覆盖（重废弃/修正措辞）。
+	if err := es.SetIntentStopReason(i1, "前提已被事实#42推翻（复核确认）"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := es.GetNode(i1)
+	if err != nil || n == nil || n.StopReason != "前提已被事实#42推翻（复核确认）" {
+		t.Fatalf("stop_reason overwrite failed: %+v err=%v", n, err)
+	}
+
+	// CAS 竞态：open 意图被领走（open→running）后，open→stopped 必须失败。
+	i3, err := es.AddIntent(map[string]any{"summary": "方向C"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := es.CompareAndSetIntentState(i3, "open", "running"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if ok, err := es.CompareAndSetIntentState(i3, "open", "stopped"); err == nil && ok {
+		t.Fatalf("CAS open->stopped on a running intent must fail")
+	}
+	// running→stopped 仍通（引擎 settle 路径）。
+	if err := es.SetIntentStopReason(i3, "跑偏止损"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := es.CompareAndSetIntentState(i3, "running", "stopped"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if c, _ := es.CountDeprecatedIntents(); c != 3 {
+		t.Fatalf("count after i3: %d, want 3", c)
+	}
+}

@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
     owner          TEXT,
     blocked_reason TEXT,
     delete_reason  TEXT,
+    stop_reason    TEXT,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at   TIMESTAMPTZ,
@@ -195,6 +196,9 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS blocked_reason TEXT;
 -- 意图假删除(soft delete):state='deleted' 时,delete_reason 记用户填写的删除原因。
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS delete_reason TEXT;
+-- 意图废弃(state='stopped'):deprecate_intent 写入的废弃原因——否决性(前提已推翻)或
+-- 止损性(跑偏/待重估),是 deprecated_intents 墓碑清单的防重派依据。历史 stopped 行为 NULL。
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS stop_reason TEXT;
 -- cold-digest (§2.3/§5.3): content_version bumps on any change that could alter a
 -- digest body (summary/state/confidence); cold_since_round stamps the planner round
 -- a node most recently went from "has a live downstream branch" to none (NULL = hot).

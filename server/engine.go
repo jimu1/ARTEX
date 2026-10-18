@@ -619,7 +619,7 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 	return false, []string{emptyTurnNudge}, ""
 }
 
-// KillWork cancels the in-flight work running intentID (planner's kill_work tool).
+// KillWork cancels the in-flight work running intentID (deprecate_intent's running branch).
 // The work's agent-core session honors ctx cancellation and aborts promptly.
 func (e *Engine) KillWork(intentID int64) error {
 	e.workMu.Lock()
@@ -991,7 +991,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		return true
 	}
-	// per-work child context so the planner's kill_work can stop just this work.
+	// per-work child context so the planner's deprecate_intent can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
 	e.registerWork(intent.ID, workCancel)
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
@@ -1045,7 +1045,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.EndLLMCall(t.ID)
 	}
 	// Capture kill state before detachWork cancels workCtx. kill = this work's
-	// ctx was cancelled (planner kill_work) while the TASK ctx kept running; a
+	// ctx was cancelled (planner deprecate_intent) while the TASK ctx kept running; a
 	// pause cancels the task ctx (ectx) instead. Checking workCtx.Err() AFTER
 	// unregister would always be true (unregister cancels it) → every completed
 	// work would be wrongly marked stopped.
