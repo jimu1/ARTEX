@@ -195,11 +195,26 @@ func FromEnv() (Config, bool) {
 // anthropic; model defaults per provider). Inputs are trimmed and the base URL
 // is normalized to the API base the provider expects (the provider appends the
 // endpoint path itself), so a full endpoint URL is tolerated.
+// envKeyRef matches an api key that is exactly one ${VAR} environment reference.
+var envKeyRef = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$`)
+
+// expandEnvKey resolves an api key of the exact form "${VAR}" from the process
+// environment, so shipped images can carry profiles without baked-in secrets
+// (keys arrive as runtime env vars). Any other value passes through untouched;
+// an unset var resolves to "" and callers already treat that as "unavailable".
+func expandEnvKey(key string) string {
+	m := envKeyRef.FindStringSubmatch(strings.TrimSpace(key))
+	if m == nil {
+		return key
+	}
+	return strings.TrimSpace(os.Getenv(m[1]))
+}
+
 func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 	c := Config{
 		Model:   strings.TrimSpace(model),
 		BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		APIKey:  strings.TrimSpace(apiKey),
+		APIKey:  expandEnvKey(apiKey),
 		Proxy:   strings.TrimSpace(proxy),
 		Stream:  true, // 默认流式;调用方按 profile 覆盖
 	}
