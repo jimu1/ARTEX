@@ -1,0 +1,30 @@
+# TSecBench 托管模式镜像:常规 ARTEX 镜像 + 内置 PostgreSQL + 答题编排入口(自启动解题)。
+# 与主 Dockerfile 前段指令保持一致以命中本地缓存;构建与导出:
+#   dist/amd64/artex 已备(-tags embedui)后:
+#   docker build --platform linux/amd64 -f Dockerfile.tsec -t artex-tsec:amd64 .
+#   docker save artex-tsec:amd64 | gzip > agent.tar.gz
+FROM python:3.12-slim-bookworm
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates ripgrep curl wget vim git jq unzip \
+      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
+    && playwright-cli --help \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+# 内置 PostgreSQL(bookworm 自带 15):容器单进程自足,沙箱无独立 db 服务。
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY dist/${TARGETARCH}/artex /app/artex
+COPY start.sh /app/start.sh
+RUN chmod +x /app/artex /app/start.sh
+COPY skills/ /app/skills/
+COPY orchestrator.py /app/orchestrator.py
+COPY tsec-entry.sh /app/tsec-entry.sh
+RUN chmod +x /app/tsec-entry.sh
+ENV IN_TSEC_SANDBOX=1
+ENTRYPOINT ["/app/tsec-entry.sh"]
