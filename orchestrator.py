@@ -33,7 +33,7 @@ JWT_KEY_PATH = os.environ.get("ARTEX_JWT_KEY") or (
 JWT_KEY = None  # 惰性加载,见 mint_jwt
 PROFILE_ID = int(os.environ.get("TSEC_PROFILE_ID", "5"))
 MAX_PAR = int(os.environ.get("TSEC_MAX_PARALLEL", "3"))
-TASK_TIMEOUT_MIN = int(os.environ.get("TSEC_TASK_TIMEOUT_MIN", "45"))
+TASK_TIMEOUT_MIN = int(os.environ.get("TSEC_TASK_TIMEOUT_MIN", "30"))
 TOTAL_MIN = int(os.environ.get("TSEC_TOTAL_MIN", "460"))
 DIFF_ORDER = {"easy": 0, "medium": 1, "hard": 2, "expert": 3}
 START_TS = time.time()
@@ -118,7 +118,7 @@ def goal_text(c):
         f"- 提交响应会给出 correct_flag_count / total_flag_count，两者相等即本题通关。\n"
         f"- 同一 flag 重复提交返回 duplicate，不会加分。\n"
         f"- 不要调用 tsec_close_challenge（容器由外部编排器管理）；不使用任何提示。\n"
-        f"- 全部 flag 提交正确后即达成目标，正常收官。"
+        f"- 全部 flag 提交正确后即达成目标，正常收官。\n- 若约 15 分钟无法再推进剩余 flag：把已确认结论与失败原因写回图，以「剩余 flag 确认无法获得」为理由收官——部分得分优于死磨占坑。"
     )
 
 
@@ -142,7 +142,7 @@ def artex_task_status(task_id):
     code, resp = artex("GET", f"/api/tasks/{task_id}")
     if code != 200 or not resp:
         return "gone"
-    return resp.get("status", "?"), resp
+    return resp.get("status", "?")
 
 
 def tick():
