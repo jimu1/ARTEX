@@ -85,15 +85,17 @@ def http_json(method, url, body=None, headers=None, timeout=30):
             return e.code, json.loads(e.read() or b"null")
         except Exception:
             return e.code, None
+    except Exception as e:  # URLError/timeout/连接拒绝等网络层故障:不抛,由调用方按非致命处理
+        return 0, {"code": "network_error", "message": repr(e)[:200]}
 
 
-def bench_call(method, path, body=None, fatal=True):
+def bench_call(method, path, body=None):
+    """平台调用一律非致命:失败返回 None,本轮跳过、30s 后重试。
+    比赛 8 小时里任何一次网络抖动都不该终结编排器。"""
     code, resp = http_json(method, BENCH + path, body, {"BENCHMARK_TOKEN": TOKEN})
-    if code >= 300:
-        msg = f"平台 {method} {path} -> {code}: {json.dumps(resp, ensure_ascii=False)[:200] if resp else ''}"
-        if fatal:
-            die(msg)
-        print(f"[orch] 非致命平台错误(跳过本轮): {msg}", flush=True)
+    if code == 0 or code >= 300:
+        print(f"[orch] 平台调用失败(跳过本轮稍后重试) {method} {path} -> {code}: "
+              f"{json.dumps(resp, ensure_ascii=False)[:200] if resp else ''}", flush=True)
         return None
     return resp
 
@@ -151,6 +153,8 @@ def artex_task_status(task_id):
 
 def tick():
     chals = list_challenges()
+    if chals is None:
+        return False  # 平台暂不可达,本轮跳过
     by_code = {c["unique_code"]: c for c in chals}
     # 1) 收尾:已通关 / ARTEX 任务终态 → close 释放坑位
     for code, st in list(running.items()):
@@ -164,7 +168,8 @@ def tick():
             print(f"[orch] {code} 任务终态({s})或超时", flush=True)
             if s in ("running", "created"):
                 artex("POST", f"/api/tasks/{st['task_id']}/control", {"action": "pause"})
-        bench_call("POST", f"/openapi/v1/challenges/close?unique_code={urllib.parse.quote(code)}")
+        if bench_call("POST", f"/openapi/v1/challenges/close?unique_code={urllib.parse.quote(code)}") is None:
+            continue  # close 失败:保留在 running,下轮重试
         print(f"[orch] {code} 容器已 close,坑位释放", flush=True)
         del running[code]
     # 2) 补位:活跃 < MAX_PAR 且有未开未完成的题 → start + 建任务
@@ -177,7 +182,7 @@ def tick():
     for c in todo:
         if len(running) >= MAX_PAR:
             break
-        started = bench_call("POST", f"/openapi/v1/challenges/start?unique_code={urllib.parse.quote(c['unique_code'])}", fatal=False)
+        started = bench_call("POST", f"/openapi/v1/challenges/start?unique_code={urllib.parse.quote(c['unique_code'])}")
         if started is None:
             attempted.discard(c["unique_code"])  # 本轮没开成,不烧掉重试权
             continue
@@ -191,6 +196,8 @@ def tick():
         running[c["unique_code"]] = {"task_id": task_id, "started": time.time()}
     # 3) 终局判断
     chals = list_challenges()
+    if chals is None:
+        return False
     open_ = [c for c in chals if not c.get("is_completed")]
     score = sum((c.get("total_score", 0) // max(c.get("flag_count", 1), 1)) * c.get("correct_flag_count", 0) for c in chals)
     done_ct = sum(1 for c in chals if c.get("is_completed"))
@@ -209,18 +216,24 @@ def todo_like(chals):
 
 def main():
     print(f"[orch] 启动: bench={BENCH} artex={ARTEX} profile={PROFILE_ID} 并发={MAX_PAR} 单题超时={TASK_TIMEOUT_MIN}min", flush=True)
+    fail_streak = 0
     while True:
         if (time.time() - START_TS) / 60 > TOTAL_MIN:
             print("[orch] 总时限到,收尾退出", flush=True)
             for code in list(running):
                 bench_call("POST", f"/openapi/v1/challenges/close?unique_code={urllib.parse.quote(code)}")
+            print("[orch] 收尾完成", flush=True)
             return
         try:
             if tick():
                 print("[orch] 全部题目已通关,退出", flush=True)
                 return
-        except Exception as e:
-            print(f"[orch] tick 异常(继续): {e}", flush=True)
+            fail_streak = 0
+        except Exception:
+            import traceback
+            fail_streak += 1
+            print(f"[orch] tick 异常(连续 {fail_streak} 次,30s 后重试):", flush=True)
+            traceback.print_exc()
         time.sleep(30)
 
 
