@@ -87,10 +87,14 @@ def http_json(method, url, body=None, headers=None, timeout=30):
             return e.code, None
 
 
-def bench_call(method, path, body=None):
+def bench_call(method, path, body=None, fatal=True):
     code, resp = http_json(method, BENCH + path, body, {"BENCHMARK_TOKEN": TOKEN})
     if code >= 300:
-        die(f"平台 {method} {path} -> {code}: {resp}")
+        msg = f"平台 {method} {path} -> {code}: {json.dumps(resp, ensure_ascii=False)[:200] if resp else ''}"
+        if fatal:
+            die(msg)
+        print(f"[orch] 非致命平台错误(跳过本轮): {msg}", flush=True)
+        return None
     return resp
 
 
@@ -173,7 +177,10 @@ def tick():
     for c in todo:
         if len(running) >= MAX_PAR:
             break
-        started = bench_call("POST", f"/openapi/v1/challenges/start?unique_code={urllib.parse.quote(c['unique_code'])}")
+        started = bench_call("POST", f"/openapi/v1/challenges/start?unique_code={urllib.parse.quote(c['unique_code'])}", fatal=False)
+        if started is None:
+            attempted.discard(c["unique_code"])  # 本轮没开成,不烧掉重试权
+            continue
         addr = started.get("container_addr") or []
         c["container_addr"] = addr
         attempted.add(c["unique_code"])
