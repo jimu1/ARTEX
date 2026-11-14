@@ -127,6 +127,47 @@ SET source=EXCLUDED.source,
 	return nil
 }
 
+// TaskAssetOrigin is one asset's registration provenance inside one task.
+// Semantics: the most recent registrar — task_asset_links keeps a single row per
+// (task, asset) and ON CONFLICT DO UPDATE rewrites it, so a later re-registration
+// of an already-known asset replaces the earlier value.
+type TaskAssetOrigin struct {
+	Source string
+	NodeID int64
+}
+
+// TaskAssetOrigins returns the provenance of the given assets within one task.
+// Missing rows simply do not appear in the map. It never fails the caller when
+// taskID <= 0 or assetIDs is empty: both return an empty result and skip the query.
+func (s *AssetStore) TaskAssetOrigins(taskID int64, assetIDs []int64) (map[int64]TaskAssetOrigin, error) {
+	if taskID <= 0 || len(assetIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`
+SELECT asset_id, source, COALESCE(source_node_id, 0)
+FROM task_asset_links
+WHERE task_id = $1 AND asset_id = ANY($2)`, taskID, assetIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]TaskAssetOrigin, len(assetIDs))
+	for rows.Next() {
+		var (
+			assetID int64
+			origin  TaskAssetOrigin
+		)
+		if err := rows.Scan(&assetID, &origin.Source, &origin.NodeID); err != nil {
+			return nil, err
+		}
+		out[assetID] = origin
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RegisterTaskAssetScopes accepts the same structured scope rules as enterprise
 // assets. The entire request is atomic: invalid input or any storage failure
 // leaves both global assets and task scope unchanged.

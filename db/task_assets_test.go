@@ -186,3 +186,82 @@ func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 		t.Fatalf("unexpected intent provenance: %+v", assets[0])
 	}
 }
+
+// TaskAssetOrigins feeds the "origin" object of the worker asset block. It must
+// return one row per asset, reflect the most recent registrar (current
+// task_asset_links semantics) and degrade on empty input instead of erroring.
+func TestTaskAssetOriginsReportsLatestRegistrar(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer d.Close()
+
+	task, err := d.CreateTask("asset origin", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+
+	as := d.Assets()
+	assetID, err := as.UpsertHTTPService(UpsertHTTPServiceReq{
+		URL: fmt.Sprintf("https://origin-%d.example.test/fxweb/swagger-resources", time.Now().UnixNano()), TaskID: task.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = as.DeleteByIDs([]int64{assetID}) })
+
+	// source_node_id has a FK to exploration_nodes: the registrars must be real
+	// intents of this task, exactly like the worker path (ownerNode).
+	exp := d.Exploration(task.ExplorationID)
+	first, err := exp.AddIntent(map[string]any{"summary": "first worker"}, 5, []int64{assetID}, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := exp.AddIntent(map[string]any{"summary": "second worker"}, 5, []int64{assetID}, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := as.SetTaskAssetSource(task.ID, assetID, "agent", "first registration", &first); err != nil {
+		t.Fatal(err)
+	}
+	origins, err := as.TaskAssetOrigins(task.ID, []int64{assetID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := origins[assetID]
+	if !ok || got.Source != "agent" || got.NodeID != first {
+		t.Fatalf("unexpected origin: %+v (present=%v)", got, ok)
+	}
+
+	// A later registration rewrites the row: the tool reports the latest
+	// registrar, not the original discoverer.
+	if err := as.SetTaskAssetSource(task.ID, assetID, "agent", "re-registered", &second); err != nil {
+		t.Fatal(err)
+	}
+	origins, err = as.TaskAssetOrigins(task.ID, []int64{assetID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := origins[assetID]; got.NodeID != second {
+		t.Fatalf("expected latest registrar %d, got %+v", second, got)
+	}
+
+	// Unknown assets are absent rather than reported with a zero value.
+	origins, err = as.TaskAssetOrigins(task.ID, []int64{assetID, assetID + 999999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := origins[assetID+999999]; exists {
+		t.Fatalf("unknown asset must not appear: %+v", origins)
+	}
+
+	// No task / no ids short-circuits without touching the database.
+	if m, err := as.TaskAssetOrigins(0, []int64{assetID}); err != nil || m != nil {
+		t.Fatalf("taskID=0 should short-circuit: %v %v", m, err)
+	}
+	if m, err := as.TaskAssetOrigins(task.ID, nil); err != nil || m != nil {
+		t.Fatalf("empty ids should short-circuit: %v %v", m, err)
+	}
+}

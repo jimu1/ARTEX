@@ -234,7 +234,7 @@ func proxyEnv(proxyAddr, caCert string) []string {
 // 捞未消费线索、deprecated_intents 封死否决方向、窗口+计数自描述截断）。
 const workerDefaultTmpl = `你是授权渗透测试系统的执行者，领到【一条意图】（一句话探索方向）。
 
-先理解再动手：看清你的意图、它锚定的目标资产、以及下方态势快照里别人已经确认了什么——别重复别人的工作。怎么打由你决定：方法、顺序、深度不设任何预设；授权范围内（含顶部【操作约束】红线）你说了算。
+先理解再动手：看清你的意图、它锚定的目标资产。怎么打由你决定：方法、顺序、深度不设任何预设；授权范围内（含顶部【操作约束】红线）你说了算。
 
 范围只有一条：这条意图是你的；执行中瞥见的其它线索（别的资产、疑似另一条利用链的入口）用 fact 记一句交给规划者，不亲自展开。
 
@@ -324,23 +324,6 @@ func renderIntentTask(intent *db.Node) string {
 	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
 }
 
-// renderWorkerGraphOverview folds the global situational snapshot into the worker's
-// launch USER message for AWARENESS ONLY. The framing is deliberately strong: the overview
-// must NOT widen the worker's job — it still does only its assigned intent. Its sole
-// purpose is letting the worker read context (existing facts/assets/hints)
-// so it avoids redundant work and doesn't re-derive what others already found.
-func renderWorkerGraphOverview(data map[string]any) string {
-	// coverage 是给规划者判断「哪类测得少 / 要不要扩范围」的信号，与 worker「只做领到的
-	// 那条意图、别追未覆盖的点」的职责边界相悖 → 从 worker 视图里剔除。data 是本次 worker
-	// 专属的新 map，删键不影响 planner。
-	delete(data, "coverage")
-	b, err := json.Marshal(data)
-	if err != nil {
-		return "" // fall back silently: the worker just won't have the global context
-	}
-	return "\n\n【全局态势快照（只读——供理解大局、防止重复劳动；范围规则见上）】：\n" + string(b)
-}
-
 // Execute runs one intent. hooks (the per-task Guard) gates every tool call; may
 // be nil. emit, if non-nil, receives one ActivityRecord per execution step.
 // notifyFinding, if non-nil, is called (intentID, summary) when this worker writes
@@ -389,14 +372,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 原始数据一起放进 system prompt：system 每次 run 都重新拼一遍、绝不会被 compaction 压掉，
 	// 长 run 里意图永远在场，续跑时也不依赖 transcript 历史是否留住那条首消息。代价是 system
 	// 混入 per-intent 易变数据、失去跨意图缓存复用；这是刻意的取舍（意图丢失比省 token 严重得多）。
-	// 与 planner「态势块放 user turn」分叉是有意的：planner 本身是产意图的那个、没有单一 mandate，
-	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
+	// 启动 user 消息只承载一句启动词（见下方 input），上下文全部在 system 里。
 	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
 	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
@@ -406,7 +387,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
-				if b, err := json.Marshal(assets); err == nil {
+				// 资产块带 origin（本任务内最近一次登记它的来源意图），让 worker 能顺着
+				// intent_id 回看"这块面是谁翻出来的"，而不是重复登记/重复探测。
+				if b, err := json.Marshal(assetViews(as, taskID, assets)); err == nil {
 					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
 				}
 				// 意图明确针对的这些资产 → 自动纳入任务测试范围（与 insertAssets 同一套
@@ -487,12 +470,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		}
 	}
 	// 意图 / 启动指令 / 意图锚定资产已随 system prompt 下发（见上方 sysBody 组装）。
-	// 这条启动 user 消息只承载【全局态势 overview】——可降级的了解大局信息，压掉无碍。
-	// overview 罕见地 marshal 失败为空时，回退一句启动词，避免首轮出现空 user 消息。
-	input := overview
-	if strings.TrimSpace(input) == "" {
-		input = "开始执行 system 里领到的这条意图。"
-	}
+	// 启动 user 消息只放一句启动词：全局态势快照已移除（worker 只读与本意图相关的内容，
+	// 全局视角由 planner 负责；模型仍需要一条 user 消息来开启对话）。
+	input := "开始执行 system 里领到的这条意图。"
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
 	noaSession := WorkerSessionID(ts.ID(), intent.ID)
