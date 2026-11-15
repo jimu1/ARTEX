@@ -300,10 +300,6 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
 }
 
-// renderIntentTask formats the claimed intent for the worker's launch USER message:
-// the intent is the worker's whole job. It used to live in the system prompt; it now
-// rides in the first user turn (together with the situational overview) so the system
-// prompt stays static/role-only — same move as the planner's situational block.
 // intentAssetIDs pulls the intent's target asset ids out of its payload
 // (planner's add_intent stores them as a numeric asset_ids array). nil on absence
 // or malformed payload.
@@ -320,6 +316,10 @@ func intentAssetIDs(intent *db.Node) []int64 {
 	return p.AssetIDs
 }
 
+// renderIntentTask formats the claimed intent for the worker's SYSTEM prompt: the
+// intent is the worker's whole job, and the system turn is rebuilt on every run so
+// it survives compaction. The launch USER message carries nothing but a one-line
+// kickoff — see the note at the input assignment in Execute.
 func renderIntentTask(intent *db.Node) string {
 	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
 }
